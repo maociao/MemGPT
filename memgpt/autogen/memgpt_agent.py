@@ -1,17 +1,18 @@
 from autogen.agentchat import Agent, ConversableAgent, UserProxyAgent, GroupChat, GroupChatManager
-from ..agent import Agent as _Agent
+from memgpt.agent import Agent as _Agent
 
-import asyncio
 from typing import Callable, Optional, List, Dict, Union, Any, Tuple
 
-from .interface import AutoGenInterface
-from ..persistence_manager import InMemoryStateManager
-from .. import system
-from .. import constants
-from .. import presets
-from ..personas import personas
-from ..humans import humans
-from ..config import AgentConfig
+from memgpt.autogen.interface import AutoGenInterface
+from memgpt.persistence_manager import LocalStateManager
+import memgpt.system as system
+import memgpt.constants as constants
+import memgpt.utils as utils
+import memgpt.presets.presets as presets
+from memgpt.config import AgentConfig, MemGPTConfig
+from memgpt.cli.cli import attach
+from memgpt.cli.cli_load import load_directory, load_webpage, load_index, load_database, load_vector_database
+from memgpt.connectors.storage import StorageConnector
 
 
 def create_memgpt_autogen_agent_from_config(
@@ -23,61 +24,94 @@ def create_memgpt_autogen_agent_from_config(
     function_map: Optional[Dict[str, Callable]] = None,
     code_execution_config: Optional[Union[Dict, bool]] = None,
     llm_config: Optional[Union[Dict, bool]] = None,
+    # config setup for non-memgpt agents:
+    nonmemgpt_llm_config: Optional[Union[Dict, bool]] = None,
     default_auto_reply: Optional[Union[str, Dict, None]] = "",
     interface_kwargs: Dict = None,
+    skip_verify: bool = False,
 ):
-    """Construct AutoGen config workflow in a clean way."""
+    """Same function signature as used in base AutoGen, but creates a MemGPT agent
+
+    Construct AutoGen config workflow in a clean way.
+    """
+    llm_config = llm_config["config_list"][0]
 
     if interface_kwargs is None:
         interface_kwargs = {}
 
-    model = constants.DEFAULT_MEMGPT_MODEL if llm_config is None else llm_config["config_list"][0]["model"]
-    persona_desc = personas.DEFAULT if system_message == "" else system_message
+    # The "system message" in AutoGen becomes the persona in MemGPT
+    persona_desc = utils.get_persona_text(constants.DEFAULT_PERSONA) if system_message == "" else system_message
+    # The user profile is based on the input mode
     if human_input_mode == "ALWAYS":
-        user_desc = humans.DEFAULT
+        user_desc = ""
     elif human_input_mode == "TERMINATE":
         user_desc = "Work by yourself, the user won't reply until you output `TERMINATE` to end the conversation."
     else:
         user_desc = "Work by yourself, the user won't reply. Elaborate as much as possible."
 
+    # If using azure or openai, save the credentials to the config
+    if llm_config["model_endpoint_type"] in ["azure", "openai"]:
+        # we load here to make sure we don't override existing values
+        # all we want to do is add extra credentials
+        config = MemGPTConfig.load()
+
+        if llm_config["model_endpoint_type"] == "azure":
+            config.azure_key = llm_config["azure_key"]
+            config.azure_endpoint = llm_config["azure_endpoint"]
+            config.azure_version = llm_config["azure_version"]
+            llm_config.pop("azure_key")
+            llm_config.pop("azure_endpoint")
+            llm_config.pop("azure_version")
+
+        elif llm_config["model_endpoint_type"] == "openai":
+            config.openai_key = llm_config["openai_key"]
+            llm_config.pop("openai_key")
+
+        config.save()
+
+    # Create an AgentConfig option from the inputs
+    llm_config.pop("name", None)
+    llm_config.pop("persona", None)
+    llm_config.pop("human", None)
+    agent_config = AgentConfig(
+        name=name,
+        persona=persona_desc,
+        human=user_desc,
+        **llm_config,
+    )
+
     if function_map is not None or code_execution_config is not None:
         raise NotImplementedError
 
     autogen_memgpt_agent = create_autogen_memgpt_agent(
-        name,
-        preset=presets.SYNC_CHAT,
-        model=model,
-        persona_description=persona_desc,
-        user_description=user_desc,
+        agent_config,
+        default_auto_reply=default_auto_reply,
         is_termination_msg=is_termination_msg,
         interface_kwargs=interface_kwargs,
+        skip_verify=skip_verify,
     )
 
     if human_input_mode != "ALWAYS":
         coop_agent1 = create_autogen_memgpt_agent(
-            name,
-            preset=presets.SYNC_CHAT,
-            model=model,
-            persona_description=persona_desc,
-            user_description=user_desc,
+            agent_config,
+            default_auto_reply=default_auto_reply,
             is_termination_msg=is_termination_msg,
             interface_kwargs=interface_kwargs,
+            skip_verify=skip_verify,
         )
         if default_auto_reply != "":
             coop_agent2 = UserProxyAgent(
-                name,
+                "User_proxy",
                 human_input_mode="NEVER",
                 default_auto_reply=default_auto_reply,
             )
         else:
             coop_agent2 = create_autogen_memgpt_agent(
-                name,
-                preset=presets.SYNC_CHAT,
-                model=model,
-                persona_description=persona_desc,
-                user_description=user_desc,
+                agent_config,
+                default_auto_reply=default_auto_reply,
                 is_termination_msg=is_termination_msg,
                 interface_kwargs=interface_kwargs,
+                skip_verify=skip_verify,
             )
 
         groupchat = GroupChat(
@@ -85,7 +119,8 @@ def create_memgpt_autogen_agent_from_config(
             messages=[],
             max_round=12 if max_consecutive_auto_reply is None else max_consecutive_auto_reply,
         )
-        manager = GroupChatManager(name=name, groupchat=groupchat, llm_config=llm_config)
+        assert nonmemgpt_llm_config is not None
+        manager = GroupChatManager(name=name, groupchat=groupchat, llm_config=nonmemgpt_llm_config)
         return manager
 
     else:
@@ -93,15 +128,14 @@ def create_memgpt_autogen_agent_from_config(
 
 
 def create_autogen_memgpt_agent(
-    autogen_name,
-    preset=presets.SYNC_CHAT,
-    model=constants.DEFAULT_MEMGPT_MODEL,
-    persona_description=personas.DEFAULT,
-    user_description=humans.DEFAULT,
+    agent_config,
+    # interface and persistence manager
+    skip_verify=False,
     interface=None,
     interface_kwargs={},
     persistence_manager=None,
-    persistence_manager_kwargs={},
+    persistence_manager_kwargs=None,
+    default_auto_reply: Optional[Union[str, Dict, None]] = "",
     is_termination_msg: Optional[Callable[[Dict], bool]] = None,
 ):
     """
@@ -117,31 +151,33 @@ def create_autogen_memgpt_agent(
     }
     ```
     """
-    interface = AutoGenInterface(**interface_kwargs) if interface is None else interface
-    persistence_manager = InMemoryStateManager(**persistence_manager_kwargs) if persistence_manager is None else persistence_manager
+    # TODO: more gracefully integrate reuse of MemGPT agents. Right now, we are creating a new MemGPT agent for
+    # every call to this function, because those scripts using create_autogen_memgpt_agent may contain calls
+    # to non-idempotent agent functions like `attach`.
 
-    agent_config = AgentConfig(
-        name=autogen_name,
-        persona=persona_description,
-        human=user_description,
-        model=model,
-        preset=presets.SYNC_CHAT,
-    )
+    interface = AutoGenInterface(**interface_kwargs) if interface is None else interface
+    if persistence_manager_kwargs is None:
+        persistence_manager_kwargs = {
+            "agent_config": agent_config,
+        }
+    persistence_manager = LocalStateManager(**persistence_manager_kwargs) if persistence_manager is None else persistence_manager
 
     memgpt_agent = presets.use_preset(
-        preset,
+        agent_config.preset,
         agent_config,
-        model,
-        persona_description,
-        user_description,
+        agent_config.model,
+        agent_config.persona,  # note: extracting the raw text, not pulling from a file
+        agent_config.human,  # note: extracting raw text, not pulling from a file
         interface,
         persistence_manager,
     )
 
     autogen_memgpt_agent = MemGPTAgent(
-        name=autogen_name,
+        name=agent_config.name,
         agent=memgpt_agent,
+        default_auto_reply=default_auto_reply,
         is_termination_msg=is_termination_msg,
+        skip_verify=skip_verify,
     )
     return autogen_memgpt_agent
 
@@ -154,6 +190,7 @@ class MemGPTAgent(ConversableAgent):
         skip_verify=False,
         concat_other_agent_messages=False,
         is_termination_msg: Optional[Callable[[Dict], bool]] = None,
+        default_auto_reply: Optional[Union[str, Dict, None]] = "",
     ):
         super().__init__(name)
         self.agent = agent
@@ -161,8 +198,44 @@ class MemGPTAgent(ConversableAgent):
         self.concat_other_agent_messages = concat_other_agent_messages
         self.register_reply([Agent, None], MemGPTAgent._generate_reply_for_user_message)
         self.messages_processed_up_to_idx = 0
+        self._default_auto_reply = default_auto_reply
 
         self._is_termination_msg = is_termination_msg if is_termination_msg is not None else (lambda x: x == "TERMINATE")
+
+    def load(self, name: str, type: str, **kwargs):
+        # call load function based on type
+        match type:
+            case "directory":
+                load_directory(name=name, **kwargs)
+            case "webpage":
+                load_webpage(name=name, **kwargs)
+            case "index":
+                load_index(name=name, **kwargs)
+            case "database":
+                load_database(name=name, **kwargs)
+            case "vector_database":
+                load_vector_database(name=name, **kwargs)
+            case _:
+                raise ValueError(f"Invalid data source type {type}")
+
+    def attach(self, data_source: str):
+        # attach new data
+        attach(self.agent.config.name, data_source)
+
+        # update agent config
+        self.agent.config.attach_data_source(data_source)
+
+        # reload agent with new data source
+        self.agent.persistence_manager.archival_memory.storage = StorageConnector.get_storage_connector(agent_config=self.agent.config)
+
+    def load_and_attach(self, name: str, type: str, force=False, **kwargs):
+        # check if data source already exists
+        if name in StorageConnector.list_loaded_data() and not force:
+            print(f"Data source {name} already exists. Use force=True to overwrite.")
+            self.attach(name)
+        else:
+            self.load(name, type, **kwargs)
+            self.attach(name)
 
     def format_other_agent_message(self, msg):
         if "name" in msg:
@@ -245,4 +318,9 @@ class MemGPTAgent(ConversableAgent):
         for m in messages:
             lines.append(f"{m}")
         ret["content"] = "\n".join(lines)
+
+        # prevent error in LM Studio caused by scenarios where MemGPT didn't say anything
+        if ret["content"] in ["", "\n"]:
+            ret["content"] = "..."
+
         return ret
